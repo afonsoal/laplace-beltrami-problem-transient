@@ -367,8 +367,6 @@ private:
     BlockSparsityPattern      	sparsity_pattern_new; // For some reason, this is based on _new here...
     BlockSparseMatrix<double> 	system_matrix_new;// For some reason, this is based on _new here...
 
-    SparsityPattern 			sparsity_pattern_paraguaio;
-    SparseMatrix<double>   		system_matrix_paraguaio;
 
     FullMatrix<double> 			FM_system_matrix;
 
@@ -387,7 +385,7 @@ private:
     Vector<double> 			    system_rhs_block01_w_constraint;
     Vector<double> 				solution_new_w_constraint;
 
-    BlockVector<double>       solution;
+    Vector<double>       solution;
     BlockVector<double>       solution_new; // For some reason, all is based on solution_new here...
     Vector<double>       solution_block0;
     Vector<double>       	solution_block1;
@@ -420,14 +418,24 @@ private:
 
 	Vector<double>       levelset;
 
-	SparseMatrix<double> mass_matrix;
-
 	std::vector <bool>   isboundary_face;
 	NewMesh 			 Obj_NewMesh;
 	int n_dofs_surface, n_dofs_inside;
 	hp::MappingCollection<dim> mapping_collection_surface;
 	int new_n_cycles;
 	std::map < double, Point<2> > levelset_face_map;
+
+	// New additions for time-dependent case.
+	FullMatrix<double> system_matrix_aux;
+	Vector <double> 	system_rhs_aux;
+	Vector<double>       old_solution;
+//	SparseMatrix<double> mass_matrix;
+	FullMatrix<double> mass_matrix;
+	FullMatrix<double> FM_mass_matrix;
+
+	double				theta;
+	double 				time_step;
+	int 				timestep_number;
 };
 
 template <int dim>
@@ -444,6 +452,8 @@ fe_q_inside (1),
 dof_handler ()
 , dof_handler_new (triangulation_new),
 new_n_cycles(_n_cycles)
+,theta(0.5)
+,time_step(1. / 500)
 
 //dof_handler (triangulation) // use original
 
@@ -510,8 +520,8 @@ void PoissonProblem<dim>::make_grid ()
 		triangulation.refine_global(3);// Now, it just makes sense to start in 2
 	}
 
-//	int refinement_global = 1;
-	int refinement_global = new_n_cycles;
+	int refinement_global = 3;
+//	int refinement_global = new_n_cycles;
 
 	triangulation.refine_global(refinement_global); // Last refinement cycle
 	dof_handler.initialize (triangulation,/*fe*/fe_justForMesh);
@@ -881,6 +891,17 @@ void PoissonProblem<dim>::setup_system_new (){
 		solution_block1.reinit(solution_new.block(1).size());
 		solution_block0_w_constraint.reinit(n_dofs_surface+1);
 		solution_new_w_constraint.reinit(dof_handler_new.n_dofs()+1);
+
+//		mass_matrix.reinit(sparsity_pattern_new);
+		mass_matrix.reinit(dof_handler_new.n_dofs(),dof_handler_new.n_dofs());
+		FM_mass_matrix.reinit(dof_handler_new.n_dofs(),dof_handler_new.n_dofs());
+
+//		old_solution.reinit (dof_handler_new.n_dofs());
+
+		solution.reinit (dof_handler_new.n_dofs());
+
+
+
 }
 
 template <int dim>
@@ -940,9 +961,10 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 	int count_cell = 0;
 
 	FullMatrix<double>   cell_matrix /*(dofs_per_cell, dofs_per_cell)*/;
+	FullMatrix<double>   cell_mass_matrix/*(dofs_per_cell, dofs_per_cell)*/;
 	Vector<double>       cell_rhs /*(dofs_per_cell)*/;
-	FullMatrix<double>   cell_j_matrix /*(dofs_per_cell+4 // 2 here, dofs_per_cell+4)*/;
-	FullMatrix<double>   cell_j_matrix_p /*(dofs_per_cell+4, dofs_per_cell+4)*/;
+	FullMatrix<double>   cell_j_matrix_us /*(dofs_per_cell+4 // 2 here, dofs_per_cell+4)*/;
+	FullMatrix<double>   cell_j_matrix_ub /*(dofs_per_cell+4, dofs_per_cell+4)*/;
 
 	std::vector<types::global_dof_index> local_dof_indices /*(dofs_per_cell)*/;
 
@@ -981,17 +1003,17 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 	std::vector< unsigned int > FULL_EXTENDED_global_dof_indices;
 
 	std::vector< Point<2> > new_face_vector;
-	std::vector< Point<2> > j_face_vector;
-	std::vector< Point<2> > j_face_vector_usurface;
+	std::vector< Point<2> > j_face_vector_us;
+	std::vector< Point<2> > j_face_vector_ub;
 	std::vector< Point<2> > all_points_vector;
 	std::vector< unsigned int  > j_face_vector_global_dofs;
 	std::vector< unsigned int  > j_face_vector_global_dofs_p;
 
 	std::vector< Point<2> > new_normal_vector;
 
-	FullMatrix<double> j_matrix (n_dofs_surface,n_dofs_surface);
+	FullMatrix<double> j_matrix_us (n_dofs_surface,n_dofs_surface);
 
-	FullMatrix<double> j_matrix_p (n_dofs_inside,n_dofs_inside);
+	FullMatrix<double> j_matrix_ub (n_dofs_inside,n_dofs_inside);
 
 	Point<2> VOID_POINT (-10000,-10000);
 	unsigned int VOID_INT = -10000;
@@ -1002,6 +1024,7 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 	double fs;
 	// From Burman et al 2014 (Cut FEM...)
 	const double 	gamma_1 = 0.01; // 0.01; // 0.1; // multiplier of stab. term of usurface
+	const double 	gamma_M = 0.25; // gamma for Mass Matrix.
 	std::cout << "Gamma_1 = " << gamma_1 << "\n";
 	const double gamma_p = /*.01;*/   0.1; // multiplier of stab. term of ubulk
 	const double b_B = 1 ;
@@ -1064,6 +1087,7 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 		local_dof_indices.resize(dofs_per_cell);
 
 		cell_matrix.reinit (dofs_per_cell,dofs_per_cell);
+		cell_mass_matrix.reinit (dofs_per_cell,dofs_per_cell);
 		cell_matrix = 0;
 		cell_rhs.reinit (dofs_per_cell);
 		cell_rhs = 0;
@@ -1081,11 +1105,14 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 			for (unsigned int q_point=0; q_point<n_q_points; ++q_point) {
 				for (unsigned int i=0; i<dofs_per_cell; ++i) {
 					for (unsigned int j=0; j<dofs_per_cell; ++j) {
+
 						cell_matrix(i,j) += (fe_values.shape_grad(i, q_point) *
-								/*shape_grad*/
-								fe_values.shape_grad /*shape_grad*/
-								(j, q_point) *
+								fe_values.shape_grad(j, q_point) *
 								fe_values.JxW (q_point));
+
+						cell_mass_matrix(i,j) += fe_values.shape_value(i,q_point)
+												*fe_values.shape_value(j,q_point)
+												*fe_values.JxW (q_point);
 					}
 					cell_rhs(i) += (fe_values.shape_value (i, q_point) *
 							f_B * fe_values.JxW (q_point));
@@ -1106,8 +1133,8 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 		face_dof_indices_ubulk.resize(dofs_per_face);
 		neighbor_face_dof_indices.resize(dofs_per_face);
 
-		cell_j_matrix.reinit (dofs_per_cell+/*2*/4,dofs_per_cell+/*2*/4);
-		cell_j_matrix_p.reinit (dofs_per_cell+/*2*/4,dofs_per_cell+/*2*/4);
+		cell_j_matrix_us.reinit (dofs_per_cell+/*2*/4,dofs_per_cell+/*2*/4);
+		cell_j_matrix_ub.reinit (dofs_per_cell+/*2*/4,dofs_per_cell+/*2*/4);
 
 		cell_global_dof_indices_ALL.resize(dofs_per_cell);
 		cell_global_dof_indices.resize(dofs_per_cell/2);
@@ -1162,8 +1189,8 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 
 		// Input the cell_diameter for the error calculation, see process_results
 		cell_diameter = cell->diameter();
-		ALLERRORS_ubulk[cycle][3] = cell_diameter;
-		ALLERRORS_usurface[cycle][3] = cell_diameter; // This is in class assemble_system
+//		ALLERRORS_ubulk[cycle][3] = cell_diameter;
+//		ALLERRORS_usurface[cycle][3] = cell_diameter; // This is in class assemble_system
 
 
 		double alfa = gamma_D/cell_diameter; // With this, the parameter alfa will change for each cycle!
@@ -1287,7 +1314,13 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 										Obj_cut_cell_integration.return_face_integration
 										(X0,X1,
 												face_normal_vector,
-												dof_index_i,dof_index_j, face_length); }
+												dof_index_i,dof_index_j, face_length);
+
+								cell_mass_matrix(dof_i,dof_j)+=
+										Obj_cut_cell_integration.mass_matrix
+										(X0,X1,face_normal_vector,dof_index_i,
+												dof_index_j,face_length );
+								}
 							}
 							if (dof_handler_new.get_fe()[active_fe_index].
 									system_to_component_index(dof_i).first == 1 ) {
@@ -1365,6 +1398,11 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 									(X0,X1,
 											face_normal_vector,
 											dof_index_i,dof_index_j, face_length);
+
+							cell_mass_matrix(dof_i,dof_j)+=
+									Obj_cut_cell_integration.mass_matrix
+									(X0,X1,face_normal_vector,dof_index_i,
+											dof_index_j,face_length );
 						}
 						if (dof_handler_new.get_fe()[active_fe_index].
 								system_to_component_index(dof_i).first == 1){
@@ -1490,7 +1528,7 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 											// repeating
 											for (unsigned int i=0;i<2;++i) {
 												unsigned int j = face_dof_indices[i];
-												j_face_vector.push_back(support_points[j]);
+												j_face_vector_us.push_back(support_points[j]);
 
 												if (std::find(j_face_vector_global_dofs.begin(),
 														j_face_vector_global_dofs.end(),
@@ -1547,7 +1585,7 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 											}
 											calls_to_j++;
 											// Important, never forget to reset local element matrix!
-											cell_j_matrix = 0;
+											cell_j_matrix_us = 0;
 											for (unsigned int dof_i=0;dof_i<dofs_per_cell+4;++dof_i) {
 												for (unsigned int dof_j=0;dof_j<dofs_per_cell+4;++dof_j) {
 
@@ -1556,7 +1594,7 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 														dof_index_i = ExtendedGlobal2Local(dof_i,cell);
 														dof_index_j = ExtendedGlobal2Local(dof_j,cell);
 
-														cell_j_matrix(dof_i, dof_j ) // dof_i,j = 0,2,4,6,(8,10)
+														cell_j_matrix_us(dof_i, dof_j ) // dof_i,j = 0,2,4,6,(8,10)
 														+=
 																Obj_cut_cell_integration.
 																getTermJ
@@ -1580,14 +1618,14 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 													if ( i%2==0 && j%2==0 ) {
 														dof_index_i = ExtendedGlobal2Local(i,cell);
 														dof_index_j = ExtendedGlobal2Local(j,cell);
-														j_matrix.add (EXTENDED_global_dof_indices[dof_index_i],
+														j_matrix_us.add (EXTENDED_global_dof_indices[dof_index_i],
 																EXTENDED_global_dof_indices[dof_index_j],
-																cell_j_matrix(i,j));
+																cell_j_matrix_us(i,j));
 													}
 												}
 											}
 										} // end if face was found (I mean, if face was already j-integrated)
-										j_face_vector.push_back(VOID_POINT);
+										j_face_vector_us.push_back(VOID_POINT);
 										j_face_vector_global_dofs.push_back(VOID_INT);
 										j_face_vector_global_dofs_p.push_back(VOID_INT);
 									} // end if face is common
@@ -1698,7 +1736,7 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 
 												for (unsigned int i=0;i<2;++i) {
 													unsigned int j = face_dof_indices_ubulk[i];
-													j_face_vector_usurface.push_back(support_points[j]);
+													j_face_vector_ub.push_back(support_points[j]);
 
 													if (std::find(j_face_vector_global_dofs_p.begin(),
 															j_face_vector_global_dofs_p.end(),
@@ -1766,8 +1804,8 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 												// Important, never forget to reset local element matrix!
 												// matrix of J term is always referring to the surface cell, which has
 												// dofs_per_cell+4 terms.
-												cell_j_matrix_p.reinit(dofs_per_cell+4,dofs_per_cell+4);
-												cell_j_matrix_p = 0;
+												cell_j_matrix_ub.reinit(dofs_per_cell+4,dofs_per_cell+4);
+												cell_j_matrix_ub = 0;
 												for (unsigned int dof_i=0;dof_i<dofs_per_cell+4;++dof_i) {
 													for (unsigned int dof_j=0;dof_j<dofs_per_cell+4;++dof_j) {
 
@@ -1777,7 +1815,7 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 															dof_index_j = ExtendedGlobal2Local(dof_j,cell);
 
 															if (cell_is_in_surface_domain(cell->neighbor(neighborCellIterator)))
-																cell_j_matrix_p(dof_i, dof_j )
+																cell_j_matrix_ub(dof_i, dof_j )
 																// dof_i,j = 0,2,4,6,(8,10)
 																+=      Obj_cut_cell_integration.
 																getTermJ
@@ -1790,7 +1828,7 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 															// getTermJ_p_inside function is adapted for a fe_face_values_neighbor object
 															// containing 2 variables (it is derived from fe_surface)
 															else
-																cell_j_matrix_p(dof_i, dof_j )
+																cell_j_matrix_ub(dof_i, dof_j )
 																// dof_i,j = 0,2,4,6,(8,10)
 																+= Obj_cut_cell_integration.
 																getTermJ_mixed(fe_face_values,
@@ -1807,17 +1845,17 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 														if ( i%2!=0 && j%2!=0 ) {
 															dof_index_i = ExtendedGlobal2Local(i,cell);
 															dof_index_j = ExtendedGlobal2Local(j,cell);
-															j_matrix_p.add
+															j_matrix_ub.add
 															(EXTENDED_global_dof_indices_p[dof_index_i] - n_dofs_surface,
 																		EXTENDED_global_dof_indices_p[dof_index_j]- n_dofs_surface,
-																		cell_j_matrix_p(i,j));
+																		cell_j_matrix_ub(i,j));
 															}
 														}
 
 												// END SAME FOR P/* */
-												j_face_vector_usurface.push_back(VOID_POINT);
+												j_face_vector_ub.push_back(VOID_POINT);
 										} // end if face was found (I mean, if face was already j-integrated)
-										j_face_vector.push_back(VOID_POINT);
+										j_face_vector_us.push_back(VOID_POINT);
 										j_face_vector_global_dofs.push_back(VOID_INT);
 										j_face_vector_global_dofs_p.push_back(VOID_INT);
 
@@ -1885,6 +1923,12 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 								(X0,X1,
 										face_normal_vector,
 										dof_index_i,dof_index_j, face_length);
+
+					cell_mass_matrix(dof_i,dof_j)+=
+							Obj_cut_cell_integration.mass_matrix
+							(X0,X1,face_normal_vector,dof_index_i,
+									dof_index_j,face_length );
+
 					// Integrate boundary term (L-B operator) : this is already inside
 					// only boundary cells.
 					if (dof_handler_new.get_fe()[active_fe_index].
@@ -2069,8 +2113,14 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 						cell_matrix(i,j));
 		for (unsigned int i=0; i<dofs_per_cell; ++i)
 			system_rhs_new(local_dof_indices[i]) += cell_rhs(i);
-		count_cell++;
 
+		for (unsigned int i=0; i<dofs_per_cell; ++i)
+					for (unsigned int j=0; j<dofs_per_cell; ++j)
+						mass_matrix.add (local_dof_indices[i],
+								local_dof_indices[j],
+								cell_mass_matrix(i,j)
+						);
+		count_cell++;
 	} // (end for cell)
 
 	FM_system_matrix.copy_from(system_matrix_new);
@@ -2083,15 +2133,15 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 	// Create block 11 with stabilization term j
 	FM_system_matrix_block11_yes_j.copy_from(system_matrix_new.block(1,1));
 	// Formulation by Burman et al 2014 (Cut FEM...)
-//	FM_system_matrix_block11_yes_j.add(cell_diameter*cell_diameter*cell_diameter*gamma_p,j_matrix_p);
+//	FM_system_matrix_block11_yes_j.add(cell_diameter*cell_diameter*cell_diameter*gamma_p,j_matrix_ub);
 	//Original formulation (An unfitted... Hansbo, Hansbo 2002);
 	// used only to compare the errors with previous solution
-	FM_system_matrix_block11_yes_j.add(cell_diameter*gamma_p,j_matrix_p);
+	FM_system_matrix_block11_yes_j.add(cell_diameter*gamma_p,j_matrix_ub);
 
 
 	// Create block 00 with stab. term as described in "Cut FEM... " Burman et al 2014.
 	FM_system_matrix_block00_w_j.copy_from(system_matrix_new.block(0,0));
-	FM_system_matrix_block00_w_j.add(gamma_1,j_matrix);
+	FM_system_matrix_block00_w_j.add(gamma_1,j_matrix_us);
 
 	// Create matrices (block 00, surface) with constraint and with / without stabilization.
 	// These matrices are augmented and have one more line and column.
@@ -2103,7 +2153,7 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 
 			FM_system_matrix_block00_no_j_yes_constraint(i,j) = FM_system_matrix(i,j);
 			FM_system_matrix_block00_yes_j_yes_constraint(i,j)
-					= FM_system_matrix(i,j) + gamma_1*j_matrix(i,j);
+					= FM_system_matrix(i,j) + gamma_1*j_matrix_us(i,j);
 		}
 	}
 	// Add constraint vector to the last line
@@ -2241,7 +2291,7 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 	std::cout << "L1 Condition Number block 00 w/constraint, stabilization: " <<  condition_number << "\n";
 	}
 
-	ALLERRORS_usurface[cycle][7] = condition_number;
+//	ALLERRORS_usurface[cycle][7] = condition_number;
 	// Create system_rhs_block0
 	system_rhs_block0.reinit(system_rhs_new.block(0).size());
 	system_rhs_block0 = system_rhs_new.block(0);
@@ -2264,6 +2314,22 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 		system_rhs_block01_w_constraint(i+n_dofs_surface)= system_rhs_block1(i);
 	}
 	system_rhs_block01_w_constraint(dof_handler_new.n_dofs()) = 0;
+
+	// Time dependent terms. Here, the full matrix with stabilization terms will be used, however,
+	// without any constraints. Also, only the ubulk solution will be time-dependent for the moment.
+
+	FM_mass_matrix.copy_from(mass_matrix);
+
+	// Input block j_matrix_ub in mass_matrix elements related to ubulk.
+	for(int unsigned i = 0; i < n_dofs_inside; ++i) {
+		for(int unsigned j = 0; j < n_dofs_inside; ++j) {
+			FM_mass_matrix	(i+ n_dofs_surface,j+n_dofs_surface) +=
+					gamma_M*cell_diameter*cell_diameter,j_matrix_ub(i,j);
+		}
+	}
+
+
+
 	// Output matrices and vectors for visualization purposes only.
 	// Output also vectors used to create plots in Gnuplot
 	if(1) {
@@ -2336,6 +2402,20 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 			}
 			FM_SYSTEM_MATRIX.close();
 		}
+		// Output mass matrix
+
+
+		{
+			std::ofstream FM_MASS_MATRIX;
+			FM_MASS_MATRIX.open("FM_mass_matrix.txt");
+			for(int unsigned i = 0; i < /*FM_*/mass_matrix.size(0); ++i) {
+				for(int unsigned j = 0; j < /*FM_*/mass_matrix.size(1); ++j) {
+					FM_MASS_MATRIX << /*FM_*/mass_matrix(i,j) << ',';
+				}
+				FM_MASS_MATRIX << std::endl;
+			}
+			FM_MASS_MATRIX.close();
+		}
 //
 //
 //		// Output block 11 without j, constraint.
@@ -2351,7 +2431,7 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 //			MATRIX.close();
 //		}
 //
-//		// Create block11 and add the j_matrix_p to it.
+//		// Create block11 and add the j_matrix_ub to it.
 //
 //
 //		// output block 11 with stabilization.
@@ -2451,10 +2531,10 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 //		// Visualize the stabilization matrix for the ubulk variable
 //		{
 //			std::ofstream J_MATRIX_P;
-//			J_MATRIX_P.open("j_matrix_p.txt");
-//			for(int unsigned i = 0; i < j_matrix_p.size(0); ++i) {
-//				for(int unsigned j = 0; j < j_matrix_p.size(1); ++j) {
-//					J_MATRIX_P << j_matrix_p(i,j) << ',';
+//			J_MATRIX_P.open("j_matrix_ub.txt");
+//			for(int unsigned i = 0; i < j_matrix_ub.size(0); ++i) {
+//				for(int unsigned j = 0; j < j_matrix_ub.size(1); ++j) {
+//					J_MATRIX_P << j_matrix_ub(i,j) << ',';
 //				}
 //				J_MATRIX_P << std::endl;
 //			}
@@ -2464,9 +2544,9 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 //		{
 //			std::ofstream J_MATRIX_U;
 //			J_MATRIX_U.open("j_matrix_u.txt");
-//			for(int unsigned i = 0; i < j_matrix.size(0); ++i) {
-//				for(int unsigned j = 0; j < j_matrix.size(1); ++j) {
-//					J_MATRIX_U << j_matrix(i,j) << ',';
+//			for(int unsigned i = 0; i < j_matrix_us.size(0); ++i) {
+//				for(int unsigned j = 0; j < j_matrix_us.size(1); ++j) {
+//					J_MATRIX_U << j_matrix_us(i,j) << ',';
 //				}
 //				J_MATRIX_U << std::endl;
 //			}
@@ -2478,9 +2558,10 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 			// Save a .txt file with the coordinates of the faces relevant to the
 			// stabilization term (j_faces)
 			std::ofstream j_faces;
-			j_faces.open("j_faces.txt");
-			for(int unsigned j = 0; j <  j_face_vector.size(); ++j) {
-				if (j_face_vector[j] == VOID_POINT) {
+//			j_faces = j_faces_usurface
+			j_faces.open("j_faces_usurface.txt");
+			for(int unsigned j = 0; j <  j_face_vector_us.size(); ++j) {
+				if (j_face_vector_us[j] == VOID_POINT) {
 					j_faces << std::endl;
 				}
 				else {
@@ -2493,7 +2574,7 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 				j_faces << j_face_vector_global_dofs[j] << ' ';
 			else j_faces << ' '<< ' ';*/
 					for(int unsigned i = 0; i < 2; ++i) {
-						j_faces << j_face_vector[j](i) << ' ';
+						j_faces << j_face_vector_us[j](i) << ' ';
 					}
 					j_faces << std::endl;
 				}
@@ -2504,14 +2585,15 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 //		// Visualize the set of faces submitted to stabilization over p (surface var.)
 		{
 			std::ofstream j_faces;
-			j_faces.open("j_faces_p.txt");
-			for(int unsigned j = 0; j <  j_face_vector_usurface.size(); ++j) {
-				if (j_face_vector_usurface[j] == VOID_POINT) {
+//			j_matrix_ub = j_matrix_ubulk
+			j_faces.open("j_matrix_ubulk.txt");
+			for(int unsigned j = 0; j <  j_face_vector_ub.size(); ++j) {
+				if (j_face_vector_ub[j] == VOID_POINT) {
 					j_faces << std::endl;
 				}
 				else {
 					for(int unsigned i = 0; i < 2; ++i) {
-						j_faces << j_face_vector_usurface[j](i) << ' ';
+						j_faces << j_face_vector_ub[j](i) << ' ';
 					}
 					j_faces << std::endl;
 				}
@@ -2574,13 +2656,18 @@ void PoissonProblem<dim>::solve ()
 	SolverControl           solver_control (1000, 1e-12);
 	SolverCG<>              solver (solver_control);
 
-	if (1) {
+
+
+	if (0) {
 	std::cout << "Solving full augmented Stiffness matrix "
 			"with stabilization terms in U and P and constraints on P ...  \n";
 
 	solver.solve (FM_system_matrix_block_w_constraint, /*solution_block0*/
 			solution_new_w_constraint , system_rhs_block01_w_constraint,
 			PreconditionIdentity());
+
+//	solver.solve (system_matrix_aux, solution, system_rhs_aux,
+//				PreconditionIdentity());
 
 	// Separate the solutions in U and P to output later. Eliminate the "mi" Lagrange Multiplier
 	for(unsigned int i = 0; i < n_dofs_surface; ++i) {
@@ -2596,10 +2683,37 @@ void PoissonProblem<dim>::solve ()
 			<< solution_new_w_constraint(dof_handler_new.n_dofs()) << "\n";
 	}
 
+	// Solve full Matrix without constraint
+	if (1) {
+	std::cout << "Solving full Stiffness matrix without constraint "
+			"with stabilization terms in U and P  \n";
+
+//	solver.solve (FM_system_matrix_block_yes_j_no_constraint, /*solution_block0*/
+//			solution_new, system_rhs_new,	PreconditionIdentity());
+	solver.solve (system_matrix_aux, solution, system_rhs_aux,
+				PreconditionIdentity());
+
+//	solver.solve (system_matrix_aux, solution, system_rhs_aux,
+//				PreconditionIdentity());
+
+	// Separate the solutions in U and P to output later. Eliminate the "mi" Lagrange Multiplier
+	for(unsigned int i = 0; i < n_dofs_surface; ++i) {
+		solution_new.block(0)(i) = solution(i);
+		solution_block0(i) = solution(i);
+	}
+
+	for(unsigned int i = 0; i < n_dofs_inside; ++i) {
+		solution_new.block(1)(i) = solution(i+n_dofs_surface);
+	}
+
+	}
+
+
+
 	//	 SOLVE UBULK NO J NO CONSTRAINT
 	if (0) {
 		std::cout << "Solving UBULK...  NO J NO CONSTRAINT\n";
-		// Here j_matrix was NOT summed into system_matrix.
+		// Here j_matrix_us was NOT summed into system_matrix.
 		solver.solve (system_matrix_new.block(1,1), solution_new.block(1), system_rhs_new.block(1),
 				PreconditionIdentity());
 		std::cout << "   " << solver_control.last_step()
@@ -2622,7 +2736,7 @@ void PoissonProblem<dim>::solve ()
 	// SOLVE UBULK YES J (naturally without CONSTRAINT)
 	if (0) {
 
-		// Here j_matrix was summed into system_matrix.
+		// Here j_matrix_us was summed into system_matrix.
 		std::cout << "Solving UBULK...  yes_j  \n";
 		solver.solve (FM_system_matrix_block11_yes_j,
 				solution_new.block(1), system_rhs_new.block(1), PreconditionIdentity());
@@ -2696,7 +2810,7 @@ void PoissonProblem<dim>::solve ()
 
 	// SOLVE USURFACE NO J YES CONSTRAINT
 	if(0) {
-		// Here j_matrix was NOT summed into system_matrix.
+		// Here j_matrix_us was NOT summed into system_matrix.
 		std::cout << "Solving USURFACE...  no_j_yes_constraint \n";
 		solver.solve (FM_system_matrix_block00_no_j_yes_constraint, solution_block0_w_constraint
 				, system_rhs_block0_w_constraint,
@@ -2761,10 +2875,12 @@ void PoissonProblem<dim>::output_results () const
 		//    	data_out_surface.add_data_vector (solution_block1, "USURFACE");
 		data_out_surface.build_patches ();
 
-		std::string filename_new = "solution_new-";
-		filename_new += ('0' + new_n_cycles);
-		filename_new += ".vtk";
-		std::ofstream output_new(filename_new.c_str());
+
+		const std::string filename = "solution-"
+				+ Utilities::int_to_string(timestep_number, 3) +
+				".vtk";
+
+		std::ofstream output_new(filename.c_str());
 		data_out_surface.write_vtk(output_new);
 	}
 
@@ -3025,63 +3141,109 @@ void PoissonProblem<dim>::interpolate_solution_usurface (){
 template <int dim>
 void PoissonProblem<dim>::run ()
 {
-	std::cout << "===================== \n ";
-	std::cout << "START NEW CYCLE = " << new_n_cycles << "\n";
-	std::cout << "===================== \n ";
 	cycle = 0;
 	n_cycles = 1;
 
-	ALLERRORS_ubulk.reinit(n_cycles,8);
-	ALLERRORS_usurface.reinit(n_cycles,8);
+	make_grid (); // This will make the first grid (cycle =0) and then just refine. Updated to cycle
+	initialize_levelset();
+//	output_results_levelset();
+	get_new_triangulation ();
 
-	while (cycle < n_cycles)
+	// SETUP 1st TIME STEP
+	setup_system_new();
+	initialize_levelset_new();
+
+	std::cout << "dim: " << dim << "\n";
+	// INITIAL CONDITION
+	old_solution.reinit (dof_handler_new.n_dofs());
+	VectorTools::interpolate(dof_handler_new,
+						ZeroFunction<dim>(2),
+//			ConstantFunction<dim>(0),
+			old_solution);
+
+	solution_new = old_solution;
+
+	timestep_number = 0;
+	double time = 0;
+
+	double final_time = 0.5;
+//	double final_time = 3;
+	//	int n_time_steps = final_time/time_step+1;
+	output_results();
+	// END 1st TIME STEP
+
+	// Here, the default system_matrix (A), system_rhs(F) and mass_matrix(M) are defined.
+	assemble_system_newMesh();
+
+	Vector<double> tmp (dof_handler_new.n_dofs());
+	Vector <double> tmp2 (dof_handler_new.n_dofs());
+	Vector <double> system_rhs_2 (dof_handler_new.n_dofs());
+
+	while (time <= final_time)
 	{
-		make_grid (); // This will make the first grid (cycle =0) and then just refine. Updated to cycle
-		initialize_levelset();
-		output_results_levelset();
-		get_new_triangulation ();
+		time += time_step;
+		++timestep_number;
 
-		setup_system_new();
-		initialize_levelset_new();
-		assemble_system_newMesh();
-		solve ();
-		output_results ();
-		process_solution_ubulk();
-		interpolate_solution_usurface();
-		cycle++;
+		std::cout << "Time step " << timestep_number << " at t=" << time
+				<< std::endl;
+
+		// Using aux matrices (A,F,M) makes it easier to manipulate the time-dependent equation.
+		// Note that the original (A,F,M) matrices are computed only once, making it much faster
+		// than calling assemble_system_newMesh every time; remember that if one wants to assemble
+		// them every time step, it is absolutely necessary to reinit (A,F,M) matrices (just as the
+		// aux matrices are being reinit below), because they are being changed in the calculation
+		// below. Also, now the solve() function is solving the aux matrices.
+
+		tmp.reinit (dof_handler_new.n_dofs());
+		tmp2.reinit (dof_handler_new.n_dofs());
+		system_rhs_2.reinit (dof_handler_new.n_dofs());
+
+		system_matrix_aux.reinit(dof_handler_new.n_dofs(),dof_handler_new.n_dofs());
+		system_matrix_aux.copy_from(/*FM_system_matrix*/FM_system_matrix_block_yes_j_no_constraint);
+		system_rhs_aux.reinit(dof_handler_new.n_dofs());
+		system_rhs_aux = system_rhs_new;
+
+		// ASSEMBLE RHS
+		// system_rhs_2 = mass_matrix*old_solution     = M*U_n-1
+		//		mass_matrix.vmult(system_rhs_2, old_solution);
+
+		FM_mass_matrix.vmult(system_rhs_2, old_solution);
+
+//		solver.solve (FM_system_matrix_block_w_constraint, /*solution_block0*/
+//				solution_new_w_constraint , system_rhs_block01_w_constraint,
+//				PreconditionIdentity());
+
+
+
+		// tmp          = system_matrix*old_solution   = A*U_n-1
+		system_matrix_aux.vmult(tmp, old_solution);
+
+
+		// system_rhs_2 += -(1-theta)*time_step*tmp    = M*U_n-1 - (1-theta)*time_step*A*U_n-1
+		system_rhs_2.add(-(1 - theta) * time_step, tmp);
+
+		// add the forcing terms to the RHS; system_rhs is ready for solution.
+		system_rhs_aux*= time_step;
+		system_rhs_aux+=system_rhs_2;
+
+		// ASSEMBLE LHS
+		// system_matrix = A*time_step*theta
+		system_matrix_aux *= theta*time_step;
+
+		// system_matrix = M+A*time_step*theta
+		//		system_matrix_aux.add(1,mass_matrix);
+		system_matrix_aux.add(1,FM_mass_matrix);
+
+		std::cout << "Time step # " << timestep_number << " at t=" << time
+				<< std::endl;
+		solve();
+		output_results();
+		old_solution = solution;
 	}
-	// Write all error info. results in a .txt file (after all cycles are completed)
-	// File used for error visualization: ErrorEvaluationGraphs.ods
-	//	Order of output:
-	//	Cycle|n_active_cells|n_dofs|cell_diameter|L2 Error|H1 Error|Linf Error|L1 Cond.Number
-    bool coupled = false;
-    if (! coupled ) {
-    	{
-    		std::ofstream write_output("ErrorEvaluation_usurface_appending.txt", std::ios::app);
-    		assert(write_output.is_open());
 
-    		for(int unsigned i = 0; i < n_cycles; ++i) {
-    			for(int unsigned j = 0; j < ALLERRORS_usurface.size()[1]; ++j) {
-    				write_output << ALLERRORS_usurface[i][j] << ',';
-    			}
-    			write_output << std::endl;
-    		}
-    		write_output.close();
-    	}
+	//	process_solution_ubulk();
+//	interpolate_solution_usurface();
 
-    	{
-    		std::ofstream write_output("ErrorEvaluation_ubulk_appending.txt", std::ios::app);
-    		assert(write_output.is_open());
-
-    		for(int unsigned i = 0; i < n_cycles; ++i) {
-    			for(int unsigned j = 0; j < ALLERRORS_ubulk.size()[1]; ++j) {
-    				write_output << ALLERRORS_ubulk[i][j] << ',';
-    			}
-    			write_output << std::endl;
-    		}
-    		write_output.close();
-    	}
-    }
 }
 } // End namespace
 
@@ -3090,13 +3252,13 @@ int main ()
 	using namespace dealii;
 	using namespace cut_cell_method;
 	const unsigned int dim = 2;
-	int _n_cycles = 5;
-	system("exec rm ErrorEvaluation_usurface_appending.txt");
-	system("exec rm ErrorEvaluation_ubulk_appending.txt");
-	for(int i = 0; i < _n_cycles; ++i) {
-		PoissonProblem<dim> Obj_PoissonProblem(i);
+//	int _n_cycles = 5;
+//	system("exec rm ErrorEvaluation_usurface_appending.txt");
+//	system("exec rm ErrorEvaluation_ubulk_appending.txt");
+//	for(int i = 0; i < _n_cycles; ++i) {
+		PoissonProblem<dim> Obj_PoissonProblem(1);
 		Obj_PoissonProblem.run ();
-	}
+//	}
 
 	return 0;
 }
