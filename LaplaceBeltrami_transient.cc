@@ -453,7 +453,7 @@ dof_handler ()
 , dof_handler_new (triangulation_new),
 new_n_cycles(_n_cycles)
 ,theta(0.5)
-,time_step(1. / 500)
+,time_step(1. / 250) // 1/500
 
 //dof_handler (triangulation) // use original
 
@@ -520,7 +520,7 @@ void PoissonProblem<dim>::make_grid ()
 		triangulation.refine_global(3);// Now, it just makes sense to start in 2
 	}
 
-	int refinement_global = 3;
+	int refinement_global = 1;
 //	int refinement_global = new_n_cycles;
 
 	triangulation.refine_global(refinement_global); // Last refinement cycle
@@ -1391,18 +1391,19 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 							if (dof_handler_new.get_fe()[active_fe_index].
 									system_to_component_index(dof_i).first == 1 &&
 									dof_handler_new.get_fe()[active_fe_index].
-									system_to_component_index(dof_j).first == 1 )
+									system_to_component_index(dof_j).first == 1 ) {
 
-							cell_matrix(dof_i,dof_j) += b_B*k_B*
-									Obj_cut_cell_integration.return_face_integration
-									(X0,X1,
-											face_normal_vector,
-											dof_index_i,dof_index_j, face_length);
+								cell_matrix(dof_i,dof_j) += b_B*k_B*
+										Obj_cut_cell_integration.return_face_integration
+										(X0,X1,
+												face_normal_vector,
+												dof_index_i,dof_index_j, face_length);
 
-							cell_mass_matrix(dof_i,dof_j)+=
-									Obj_cut_cell_integration.mass_matrix
-									(X0,X1,face_normal_vector,dof_index_i,
-											dof_index_j,face_length );
+								cell_mass_matrix(dof_i,dof_j)+=
+										Obj_cut_cell_integration.mass_matrix
+										(X0,X1,face_normal_vector,dof_index_i,
+												dof_index_j,face_length );
+							}
 						}
 						if (dof_handler_new.get_fe()[active_fe_index].
 								system_to_component_index(dof_i).first == 1){
@@ -1916,7 +1917,7 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 					if (dof_handler_new.get_fe()[active_fe_index].
 							system_to_component_index(dof_i).first == 1 &&
 							dof_handler_new.get_fe()[active_fe_index].
-							system_to_component_index(dof_j).first == 1 )
+							system_to_component_index(dof_j).first == 1 ) {
 
 						cell_matrix(dof_i,dof_j) += b_B*k_B*
 								Obj_cut_cell_integration.return_face_integration
@@ -1928,6 +1929,7 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 							Obj_cut_cell_integration.mass_matrix
 							(X0,X1,face_normal_vector,dof_index_i,
 									dof_index_j,face_length );
+					}
 
 					// Integrate boundary term (L-B operator) : this is already inside
 					// only boundary cells.
@@ -2324,7 +2326,7 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 	for(int unsigned i = 0; i < n_dofs_inside; ++i) {
 		for(int unsigned j = 0; j < n_dofs_inside; ++j) {
 			FM_mass_matrix	(i+ n_dofs_surface,j+n_dofs_surface) +=
-					gamma_M*cell_diameter*cell_diameter,j_matrix_ub(i,j);
+					gamma_M*cell_diameter*cell_diameter*j_matrix_ub(i,j);
 		}
 	}
 
@@ -2408,14 +2410,27 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 		{
 			std::ofstream FM_MASS_MATRIX;
 			FM_MASS_MATRIX.open("FM_mass_matrix.txt");
-			for(int unsigned i = 0; i < /*FM_*/mass_matrix.size(0); ++i) {
-				for(int unsigned j = 0; j < /*FM_*/mass_matrix.size(1); ++j) {
-					FM_MASS_MATRIX << /*FM_*/mass_matrix(i,j) << ',';
+			for(int unsigned i = 0; i < FM_mass_matrix.size(0); ++i) {
+				for(int unsigned j = 0; j < FM_mass_matrix.size(1); ++j) {
+					FM_MASS_MATRIX << FM_mass_matrix(i,j) << ',';
 				}
 				FM_MASS_MATRIX << std::endl;
 			}
 			FM_MASS_MATRIX.close();
 		}
+
+		{
+			std::ofstream MASS_MATRIX;
+			MASS_MATRIX.open("mass_matrix.txt");
+			for(int unsigned i = 0; i < mass_matrix.size(0); ++i) {
+				for(int unsigned j = 0; j < mass_matrix.size(1); ++j) {
+					MASS_MATRIX << mass_matrix(i,j) << ',';
+				}
+				MASS_MATRIX << std::endl;
+			}
+			MASS_MATRIX.close();
+		}
+
 //
 //
 //		// Output block 11 without j, constraint.
@@ -2528,18 +2543,18 @@ void PoissonProblem<dim>::assemble_system_newMesh ()
 			CONSTRAINT_VECTOR.close();
 		}
 //
-//		// Visualize the stabilization matrix for the ubulk variable
-//		{
-//			std::ofstream J_MATRIX_P;
-//			J_MATRIX_P.open("j_matrix_ub.txt");
-//			for(int unsigned i = 0; i < j_matrix_ub.size(0); ++i) {
-//				for(int unsigned j = 0; j < j_matrix_ub.size(1); ++j) {
-//					J_MATRIX_P << j_matrix_ub(i,j) << ',';
-//				}
-//				J_MATRIX_P << std::endl;
-//			}
-//			J_MATRIX_P.close();
-//		}
+		// Visualize the stabilization matrix for the ubulk variable
+		{
+			std::ofstream J_MATRIX_P;
+			J_MATRIX_P.open("j_matrix_ub.txt");
+			for(int unsigned i = 0; i < j_matrix_ub.size(0); ++i) {
+				for(int unsigned j = 0; j < j_matrix_ub.size(1); ++j) {
+					J_MATRIX_P << j_matrix_ub(i,j) << ',';
+				}
+				J_MATRIX_P << std::endl;
+			}
+			J_MATRIX_P.close();
+		}
 		// Visualize the stabilization matrix for the usurface variable
 //		{
 //			std::ofstream J_MATRIX_U;
@@ -3166,7 +3181,7 @@ void PoissonProblem<dim>::run ()
 	timestep_number = 0;
 	double time = 0;
 
-	double final_time = 0.5;
+	double final_time = 0.50;
 //	double final_time = 3;
 	//	int n_time_steps = final_time/time_step+1;
 	output_results();
@@ -3228,7 +3243,10 @@ void PoissonProblem<dim>::run ()
 
 		// ASSEMBLE LHS
 		// system_matrix = A*time_step*theta
-		system_matrix_aux *= theta*time_step;
+		system_matrix_aux *= time_step;
+		for (unsigned int i = n_dofs_surface; i<dof_handler_new.n_dofs(); ++i)
+			for (unsigned int j = n_dofs_surface; j<dof_handler_new.n_dofs(); ++j)
+				system_matrix_aux(i,j) *= theta;
 
 		// system_matrix = M+A*time_step*theta
 		//		system_matrix_aux.add(1,mass_matrix);
